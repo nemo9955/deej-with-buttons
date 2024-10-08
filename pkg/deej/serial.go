@@ -13,6 +13,8 @@ import (
 	"github.com/jacobsa/go-serial/serial"
 	"go.uber.org/zap"
 
+	"github.com/micmonay/keybd_event"
+
 	"github.com/omriharel/deej/pkg/deej/util"
 )
 
@@ -31,8 +33,11 @@ type SerialIO struct {
 
 	lastKnownNumSliders        int
 	currentSliderPercentValues []float32
+	lastKnownNumButtons        int
+	currentButtonValues        []int
 
 	sliderMoveConsumers []chan SliderMoveEvent
+	buttonMoveConsumers []chan ButtonPressEvent
 }
 
 // SliderMoveEvent represents a single slider move captured by deej
@@ -41,7 +46,14 @@ type SliderMoveEvent struct {
 	PercentValue float32
 }
 
+type ButtonPressEvent struct {
+	ButtonID      int
+	PreviousValue int
+	ButtonValue   int
+}
+
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
+var buttonLinePattern = regexp.MustCompile(`^~\d(\~\d)*~\r\n$`) // ~1~ or ~0~ for 1 button values
 
 // NewSerialIO creates a SerialIO instance that uses the provided deej
 // instance's connection info to establish communications with the arduino chip
@@ -55,6 +67,7 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 		connected:           false,
 		conn:                nil,
 		sliderMoveConsumers: []chan SliderMoveEvent{},
+		buttonMoveConsumers: []chan ButtonPressEvent{},
 	}
 
 	logger.Debug("Created serial i/o instance")
@@ -164,6 +177,7 @@ func (sio *SerialIO) setupOnConfigReload() {
 				go func() {
 					<-time.After(stopDelay)
 					sio.lastKnownNumSliders = 0
+					sio.lastKnownNumButtons = 0
 				}()
 
 				// if connection params have changed, attempt to stop and start the connection
@@ -226,7 +240,178 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 	return ch
 }
 
+var KEY_MAPS = map[string]int{
+	// https://github.com/micmonay/keybd_event/blob/master/keybd_windows.go
+	"VK_MEDIA_NEXT_TRACK":    keybd_event.VK_MEDIA_NEXT_TRACK,
+	"VK_MEDIA_PREV_TRACK":    keybd_event.VK_MEDIA_PREV_TRACK,
+	"VK_MEDIA_STOP":          keybd_event.VK_MEDIA_STOP,
+	"VK_MEDIA_PLAY_PAUSE":    keybd_event.VK_MEDIA_PLAY_PAUSE,
+	"VK_LAUNCH_MEDIA_SELECT": keybd_event.VK_LAUNCH_MEDIA_SELECT,
+	"VK_VOLUME_MUTE":         keybd_event.VK_VOLUME_MUTE,
+	"VK_VOLUME_DOWN":         keybd_event.VK_VOLUME_DOWN,
+	"VK_VOLUME_UP":           keybd_event.VK_VOLUME_UP,
+	"VK_BROWSER_BACK":        keybd_event.VK_BROWSER_BACK,
+	"VK_BROWSER_FORWARD":     keybd_event.VK_BROWSER_FORWARD,
+	"VK_BROWSER_REFRESH":     keybd_event.VK_BROWSER_REFRESH,
+	"VK_BROWSER_STOP":        keybd_event.VK_BROWSER_STOP,
+	"VK_BROWSER_SEARCH":      keybd_event.VK_BROWSER_SEARCH,
+	"VK_BROWSER_FAVORITES":   keybd_event.VK_BROWSER_FAVORITES,
+	"VK_BROWSER_HOME":        keybd_event.VK_BROWSER_HOME,
+}
+
+func (sio *SerialIO) kbKeySimple(kb *keybd_event.KeyBonding, key string) error {
+
+	key_data, exists := KEY_MAPS[key]
+	if !exists {
+		return errors.New("Key not found")
+	}
+
+	kb.SetKeys(key_data)
+
+	return nil
+}
+
+func (sio *SerialIO) pressedButton(logger *zap.SugaredLogger, buttonEvent ButtonPressEvent) {
+	bindex := buttonEvent.ButtonID
+	logger.Debugw("pressedButton", "event", buttonEvent, "ButtonMapping.m[bindex]", sio.deej.config.ButtonMapping.m[bindex])
+
+	kb, err := keybd_event.NewKeyBonding()
+	if err != nil {
+		panic(err)
+	}
+
+	for conf_ind, conf_key := range sio.deej.config.ButtonMapping.m[bindex] {
+		// logger.Debugw("pressedButton",
+		// 	"conf_ind", conf_ind,
+		// 	"conf_key", conf_key,
+		// )
+		// https://github.com/micmonay/keybd_event/blob/master/keybd_windows.go#L281
+		// send_key := "VK_MEDIA_PLAY_PAUSE"
+		// KEY_MAPS
+
+		key_err := err
+		if conf_key == "FORCE_REFRESH" {
+			kb.SetKeys(keybd_event.VK_F5)
+			kb.HasCTRL(true)
+		} else if conf_key == "WIN_MIC_MUTE_TOGGLE" {
+			kb.SetKeys(keybd_event.VK_K)
+			kb.HasSuper(true)
+			kb.HasALTGR(true)
+		} else {
+			key_err = sio.kbKeySimple(&kb, conf_key)
+			// logger.Debugw("kbKeySimple", "key_err", key_err)
+		}
+
+		if key_err != nil {
+			logger.Debugw("pressedButton invalid key",
+				"conf_ind", conf_ind,
+				"conf_key", conf_key,
+				"key_err", key_err,
+			)
+		}
+
+	}
+
+	// Press the selected keys
+	err = kb.Launching()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (sio *SerialIO) handleButtons(logger *zap.SugaredLogger, line string) {
+
+	// trim the suffix
+	line = strings.TrimSuffix(line, "\r\n")
+	line = strings.TrimSuffix(line, "~")
+	line = strings.Trim(line, "~")
+
+	// logger.Debugw("raw button", "event", line)
+
+	// split on ~, this gives a slice of numerical strings between "0" and "9"
+	splitLine := strings.Split(line, "~")
+	numSliders := len(splitLine)
+
+	// logger.Debugw("raw button data",
+	// 	"splitLine", splitLine,
+	// 	"numSliders", numSliders,
+	// )
+
+	// update our slider count, if needed - this will send slider move events for all
+	if numSliders != sio.lastKnownNumButtons {
+		logger.Infow("Detected buttons", "amount", numSliders)
+		sio.lastKnownNumButtons = numSliders
+		sio.currentButtonValues = make([]int, numSliders)
+
+		// reset everything to be an impossible value to force the slider move event later
+		for idx := range sio.currentButtonValues {
+			sio.currentButtonValues[idx] = -1.0
+		}
+	}
+
+	// for each slider:
+	moveEvents := []ButtonPressEvent{}
+	for sliderIdx, stringValue := range splitLine {
+
+		// convert string values to integers ("1023" -> 1023)
+		number, _ := strconv.Atoi(stringValue)
+		number = int(number)
+
+		// turns out the first line could come out dirty sometimes (i.e. "4558|925|41|643|220")
+		// so let's check the first number for correctness just in case
+		if sliderIdx == 0 && number > 9 {
+			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
+			return
+		}
+
+		// logger.Debugw("button info",
+		// 	"sliderIdx", sliderIdx,
+		// 	"stringValue", stringValue,
+		// 	"number", number,
+		// )
+
+		// check if it changes the desired state (could just be a jumpy raw slider value)
+		if sio.currentButtonValues[sliderIdx] != number {
+
+			moveEvents = append(moveEvents, ButtonPressEvent{
+				ButtonID:      sliderIdx,
+				PreviousValue: sio.currentButtonValues[sliderIdx],
+				ButtonValue:   number,
+			})
+
+			sio.currentButtonValues[sliderIdx] = number
+
+			if sio.deej.Verbose() {
+				logger.Debugw("Button state changed", "event", moveEvents[len(moveEvents)-1])
+			}
+		}
+	}
+
+	for _, moveEvent := range moveEvents {
+		if moveEvent.PreviousValue == 0 && moveEvent.ButtonValue != 0 {
+			sio.pressedButton(logger, moveEvent)
+		}
+	}
+
+	// TODO not properly implemented !!!!!!!
+	// // deliver move events if there are any, towards all potential consumers
+	// if len(moveEvents) > 0 {
+	// 	for _, consumer := range sio.buttonMoveConsumers {
+	// 		for _, moveEvent := range moveEvents {
+	// 			consumer <- moveEvent
+	// 		}
+	// 	}
+	// }
+
+	return
+}
+
 func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
+
+	if buttonLinePattern.MatchString(line) {
+		sio.handleButtons(logger, line)
+		return
+	}
 
 	// this function receives an unsanitized line which is guaranteed to end with LF,
 	// but most lines will end with CRLF. it may also have garbage instead of
