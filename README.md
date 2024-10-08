@@ -1,4 +1,18 @@
-# deej
+# deej with buttons
+
+## This fork is *Work In Progress* !!!
+
+The buttons are still in early state of implementation and configuration/setup still relies on building from source for some things. This is tested only on Windows!
+
+The idea was to add buttons to `deej` alongside the sliders to do random things like play/pause music or mute a slider but adjusting the volume would still allow to unmute.
+
+This aproach keeps the ideology of the board to send info to the OS App via serial, and the app to trigger the virtual button presses or mute/unmute events.
+
+A complex example of how the code will look like on the arduino side can be seen in : `arduino\deej-buttons\deej-buttons.ino`
+
+The root `config.yaml` waas changed to have support for buttons and it is possible to configure some key using only config, and the original functionality to change the confing and deej to detect it is still there.
+
+The keystone of this aproach is `https://github.com/micmonay/keybd_event` as it seems the simplest library in go that can send such events.
 
 deej is an **open-source hardware volume mixer** for Windows and Linux PCs. It lets you use real-life sliders (like a DJ!) to **seamlessly control the volumes of different apps** (such as your music player, the game you're playing and your voice chat session) without having to stop what you're doing.
 
